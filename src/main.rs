@@ -1,5 +1,6 @@
 use crate::exercise::{Exercise, ExerciseList};
-use crate::run::run;
+use crate::project::RustAnalyzerProject;
+use crate::run::{reset, run};
 use crate::verify::verify;
 use argh::FromArgs;
 use console::Emoji;
@@ -20,11 +21,12 @@ use std::time::Duration;
 mod ui;
 
 mod exercise;
+mod project;
 mod run;
 mod verify;
 
 // In sync with crate version
-const VERSION: &str = "4.7.1";
+const VERSION: &str = "5.2.1";
 
 #[derive(FromArgs, PartialEq, Debug)]
 /// Rustlings is a collection of small exercises to get you used to writing and reading Rust code
@@ -45,8 +47,10 @@ enum Subcommands {
     Verify(VerifyArgs),
     Watch(WatchArgs),
     Run(RunArgs),
+    Reset(ResetArgs),
     Hint(HintArgs),
     List(ListArgs),
+    Lsp(LspArgs),
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
@@ -69,6 +73,15 @@ struct RunArgs {
 }
 
 #[derive(FromArgs, PartialEq, Debug)]
+#[argh(subcommand, name = "reset")]
+/// Resets a single exercise using "git stash -- <filename>"
+struct ResetArgs {
+    #[argh(positional)]
+    /// the name of the exercise
+    name: String,
+}
+
+#[derive(FromArgs, PartialEq, Debug)]
 #[argh(subcommand, name = "hint")]
 /// Returns a hint for the given exercise
 struct HintArgs {
@@ -76,6 +89,11 @@ struct HintArgs {
     /// the name of the exercise
     name: String,
 }
+
+#[derive(FromArgs, PartialEq, Debug)]
+#[argh(subcommand, name = "lsp")]
+/// Enable rust-analyzer for exercises
+struct LspArgs {}
 
 #[derive(FromArgs, PartialEq, Debug)]
 #[argh(subcommand, name = "list")]
@@ -155,7 +173,9 @@ fn main() {
                     "Pending"
                 };
                 let solve_cond = {
-                    (e.looks_done() && subargs.solved) || (!e.looks_done() && subargs.unsolved) || (!subargs.solved && !subargs.unsolved)
+                    (e.looks_done() && subargs.solved)
+                        || (!e.looks_done() && subargs.unsolved)
+                        || (!subargs.solved && !subargs.unsolved)
                 };
                 if solve_cond && (filter_cond || subargs.filter.is_none()) {
                     let line = if subargs.paths {
@@ -196,6 +216,12 @@ fn main() {
             run(exercise, verbose).unwrap_or_else(|_| std::process::exit(1));
         }
 
+        Subcommands::Reset(subargs) => {
+            let exercise = find_exercise(&subargs.name, &exercises);
+
+            reset(exercise).unwrap_or_else(|_| std::process::exit(1));
+        }
+
         Subcommands::Hint(subargs) => {
             let exercise = find_exercise(&subargs.name, &exercises);
 
@@ -203,17 +229,43 @@ fn main() {
         }
 
         Subcommands::Verify(_subargs) => {
-            verify(&exercises, (0, exercises.len()), verbose).unwrap_or_else(|_| std::process::exit(1));
+            verify(&exercises, (0, exercises.len()), verbose)
+                .unwrap_or_else(|_| std::process::exit(1));
+        }
+
+        Subcommands::Lsp(_subargs) => {
+            let mut project = RustAnalyzerProject::new();
+            project
+                .get_sysroot_src()
+                .expect("Couldn't find toolchain path, do you have `rustc` installed?");
+            project
+                .exercies_to_json()
+                .expect("Couldn't parse rustlings exercises files");
+
+            if project.crates.is_empty() {
+                println!("Failed find any exercises, make sure you're in the `rustlings` folder");
+            } else if project.write_to_disk().is_err() {
+                println!("Failed to write rust-project.json to disk for rust-analyzer");
+            } else {
+                println!("Successfully generated rust-project.json");
+                println!("rust-analyzer will now parse exercises, restart your language server or editor")
+            }
         }
 
         Subcommands::Watch(_subargs) => match watch(&exercises, verbose) {
             Err(e) => {
-                println!("Error: Could not watch your progress. Error message was {:?}.", e);
+                println!(
+                    "Error: Could not watch your progress. Error message was {:?}.",
+                    e
+                );
                 println!("Most likely you've run out of disk space or your 'inotify limit' has been reached.");
                 std::process::exit(1);
             }
             Ok(WatchStatus::Finished) => {
-                println!("{emoji} All exercises completed! {emoji}", emoji = Emoji("🎉", "★"));
+                println!(
+                    "{emoji} All exercises completed! {emoji}",
+                    emoji = Emoji("🎉", "★")
+                );
                 println!("\n{}\n", FENISH_LINE);
             }
             Ok(WatchStatus::Unfinished) => {
@@ -224,7 +276,10 @@ fn main() {
     }
 }
 
-fn spawn_watch_shell(failed_exercise_hint: &Arc<Mutex<Option<String>>>, should_quit: Arc<AtomicBool>) {
+fn spawn_watch_shell(
+    failed_exercise_hint: &Arc<Mutex<Option<String>>>,
+    should_quit: Arc<AtomicBool>,
+) {
     let failed_exercise_hint = Arc::clone(failed_exercise_hint);
     println!("Welcome to watch mode! You can type 'help' to get an overview of the commands you can use here.");
     thread::spawn(move || loop {
@@ -261,16 +316,22 @@ fn spawn_watch_shell(failed_exercise_hint: &Arc<Mutex<Option<String>>>, should_q
 
 fn find_exercise<'a>(name: &str, exercises: &'a [Exercise]) -> &'a Exercise {
     if name.eq("next") {
-        exercises.iter().find(|e| !e.looks_done()).unwrap_or_else(|| {
-            println!("🎉 Congratulations! You have done all the exercises!");
-            println!("🔚 There are no more exercises to do next!");
-            std::process::exit(1)
-        })
+        exercises
+            .iter()
+            .find(|e| !e.looks_done())
+            .unwrap_or_else(|| {
+                println!("🎉 Congratulations! You have done all the exercises!");
+                println!("🔚 There are no more exercises to do next!");
+                std::process::exit(1)
+            })
     } else {
-        exercises.iter().find(|e| e.name == name).unwrap_or_else(|| {
-            println!("No exercise found for '{}'!", name);
-            std::process::exit(1)
-        })
+        exercises
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| {
+                println!("No exercise found for '{}'!", name);
+                std::process::exit(1)
+            })
     }
 }
 
@@ -308,8 +369,13 @@ fn watch(exercises: &[Exercise], verbose: bool) -> notify::Result<WatchStatus> {
                         let filepath = b.as_path().canonicalize().unwrap();
                         let pending_exercises = exercises
                             .iter()
-                            .find(|e| filepath.ends_with(&e.path)).into_iter()
-                            .chain(exercises.iter().filter(|e| !e.looks_done() && !filepath.ends_with(&e.path)));
+                            .find(|e| filepath.ends_with(&e.path))
+                            .into_iter()
+                            .chain(
+                                exercises
+                                    .iter()
+                                    .filter(|e| !e.looks_done() && !filepath.ends_with(&e.path)),
+                            );
                         let num_done = exercises.iter().filter(|e| e.looks_done()).count();
                         clear_screen();
                         match verify(pending_exercises, (num_done, exercises.len()), verbose) {
@@ -367,6 +433,8 @@ started, here's a couple of notes about how Rustlings operates:
 4. If an exercise doesn't make sense to you, feel free to open an issue on GitHub!
    (https://github.com/rust-lang/rustlings/issues/new). We look at every issue,
    and sometimes, other learners do too so you can help each other out!
+5. If you want to use `rust-analyzer` with exercises, which provides features like 
+   autocompletion, run the command `rustlings lsp`. 
 
 Got all that? Great! To get started, run `rustlings watch` in order to get the first
 exercise. Make sure to have your editor open!"#;
